@@ -1,15 +1,10 @@
 """
 utils/price_analyzer.py
 
-Покращення:
-- RESERVED/ORDER_PROCESSING як навчальний сигнал у регресії
-- DELETED як негативний сигнал (штраф до ціни)
-- Recency-зважена регресія (свіжі дані важливіші)
-- log_cat_sold_median як окрема фіча
-- battery_pct / memory_gb / item_year / has_specs у структурних фічах
-- market_speed_info() — індикатор швидкості ринку для UI
-- price_position() — де ціна відносно ринку (прогрес-бар для UI)
-- comparables_for_trust() — компаративи для блоку довіри в UI
+Покращення ML (v3 - Stacking & Categorical Features):
+- Stacking: Ridge (текст) -> HistGradientBoosting (структура).
+- Категоріальні фічі: category_id тепер обробляється нативно.
+- Розумні викиди: видалення топ-2% найдорожчих товарів всередині кожної категорії.
 """
 
 import re
@@ -19,7 +14,7 @@ from collections import Counter
 from typing import Optional, Dict, List, Tuple
 
 from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import mean_absolute_percentage_error
 from scipy.sparse import hstack, csr_matrix
@@ -48,8 +43,8 @@ class PriceAnalyzer:
         self,
         df: pd.DataFrame,
         fast_sold: pd.DataFrame = None,
-        reserved_df: pd.DataFrame = None,   # НОВИЙ
-        deleted_df: pd.DataFrame = None,     # НОВИЙ
+        reserved_df: pd.DataFrame = None,
+        deleted_df: pd.DataFrame = None,
     ):
         self.df          = df.copy()
         self.fast_sold   = fast_sold
@@ -69,13 +64,12 @@ class PriceAnalyzer:
         d["has_brand"]  = d["text"].apply(lambda x: int(bool(BRAND_RE.search(x))))
         d["cond_good"]  = d["text"].apply(lambda x: int(bool(CONDITION_GOOD_RE.search(x))))
         d["cond_bad"]   = d["text"].apply(lambda x: int(bool(CONDITION_BAD_RE.search(x))))
-        d["category_id"] = d["category_id"].fillna(0)
+        d["category_id"] = d["category_id"].fillna(0).astype(int)
 
         cat_med = d.groupby("category_id")["price"].transform("median")
         d["cat_median"]     = cat_med.fillna(d["price"].median())
         d["log_cat_median"] = np.log1p(d["cat_median"])
 
-        # Окремо медіана sold_price
         sold_med = d.groupby("category_id")["sold_price"].transform("median").fillna(
             d["price"].median()
         )
@@ -93,16 +87,15 @@ class PriceAnalyzer:
         cat_days = d.groupby("category_id")["days_to_sell"].transform("median")
         d["cat_days_median"] = cat_days.fillna(30)
 
-        # Recency weight (вже може бути з data_loader, але перераховуємо для надійності)
         if "recency_weight" not in d.columns:
             now = pd.Timestamp.now(tz="UTC")
             days_old = (now - d["created_at"]).dt.days.clip(0, 365).fillna(180)
             d["recency_weight"] = np.exp(-days_old / 30)
 
-        # Specs (вже можуть бути з data_loader)
+        # Specs (навмисно залишаємо NaN, HistGradientBoosting вміє з ними працювати)
         for col in ["battery_pct", "memory_gb", "item_year", "has_specs"]:
             if col not in d.columns:
-                d[col] = 0
+                d[col] = np.nan
 
     def _structural_features(self) -> List[str]:
         return [
@@ -114,83 +107,91 @@ class PriceAnalyzer:
         ]
 
     def _get_struct_matrix(self, df_slice: pd.DataFrame) -> pd.DataFrame:
-        return df_slice[self._structural_features()].fillna(0)
+        # Не робимо fillna(0) для всіх, бо 0 пам'яті і невідома пам'ять — це різне!
+        return df_slice[self._structural_features()]
 
     # ── 1. Регресія ───────────────────────────────────────────────────────────
 
     def _train_regression(self):
-        """
-        Навчаємо на трьох джерелах з різними вагами:
-          - sold_price (SOLD)          вага = 3.0 (найнадійніше)
-          - RESERVED/ORDER_PROCESSING  вага = 2.0 (ціна спрацювала)
-          - ACTIVE з original_price    вага = 1.0 (ринкова пропозиція)
-          - DELETED (negative signal)  вага = 0.5, з penalty
-        """
         frames = []
 
         # ── Продані (основне джерело) ──
-        sold = self.df[self.df["sold_price"].notna()].copy()
-        sold["_target"] = sold["sold_price"]
-        sold["_weight"] = 3.0
-        frames.append(sold)
+        if self.fast_sold is not None and not self.fast_sold.empty:
+            sold = self.fast_sold.copy()
+            sold = self._ensure_features(sold)
+            # Використовуємо sold_price, якщо його немає — original_price
+            sold["_target"] = sold["sold_price"].fillna(sold["original_price"])
+            sold["_weight"] = 3.0
+            frames.append(sold)
 
         # ── RESERVED / ORDER_PROCESSING ──
         if not self.reserved_df.empty:
             res = self.reserved_df.copy()
-            # Додаємо потрібні фічі якщо їх немає
             res = self._ensure_features(res)
             res["_target"] = res["original_price"]
             res["_weight"] = 2.0
             frames.append(res)
 
-        # ── DELETED — таргет зі знижкою 15% (бо ціна була завищена) ──
-        if not self.deleted_df.empty:
-            del_ = self.deleted_df.copy()
-            del_ = self._ensure_features(del_)
-            del_["_target"] = del_["original_price"] * 0.85   # штраф 15%
-            del_["_weight"] = 0.5
-            frames.append(del_)
+        # ── ACTIVE (Семпл) ──
+        n_sample = min(4000, len(self.df))
+        if n_sample > 0:
+            active_sample = self.df.sample(n=n_sample, random_state=42).copy()
+            active_sample["_target"] = active_sample["original_price"]
+            active_sample["_weight"] = 1.0
+            frames.append(active_sample)
 
         train = pd.concat(frames, ignore_index=True)
         train = train[train["_target"].notna() & (train["_target"] > 0)]
 
-        # Clip outliers
-        q99 = train["_target"].quantile(0.99)
-        train = train[train["_target"] <= q99]
+        # Розумні викиди: відкидаємо топ-2% найдорожчих товарів ВСЕРЕДИНІ кожної категорії
+        q98_per_cat = train.groupby("category_id")["_target"].transform(lambda x: x.quantile(0.98))
+        train = train[train["_target"] <= q98_per_cat]
 
         y       = np.log1p(train["_target"])
         weights = train["_weight"].values
 
-        # TF-IDF + Ridge
+        # 1. TF-IDF + Ridge (Навчаємо ТІЛЬКИ на тексті)
         self.tfidf = TfidfVectorizer(
             max_features=3000, min_df=5,
             ngram_range=(1, 2), sublinear_tf=True,
         )
-        text_col   = train["text"].fillna("") if "text" in train.columns else pd.Series([""] * len(train))
-        X_tfidf    = self.tfidf.fit_transform(text_col)
-        X_struct   = self._get_struct_matrix(train)
-        X_combined = hstack([csr_matrix(X_struct.values), X_tfidf])
+        text_col = train["text"].fillna("") if "text" in train.columns else pd.Series([""] * len(train))
+        X_tfidf = self.tfidf.fit_transform(text_col)
 
         self.ridge = Ridge(alpha=10.0)
-        self.ridge.fit(X_combined, y, sample_weight=weights)
+        self.ridge.fit(X_tfidf, y, sample_weight=weights)
 
-        # RF (тільки структурні фічі)
-        self.rf = RandomForestRegressor(
-            n_estimators=120, max_depth=12,
-            min_samples_leaf=5, random_state=42, n_jobs=-1,
+        # 2. Отримуємо прогнози тексту (Text Predictions)
+        text_preds = self.ridge.predict(X_tfidf)
+
+        # 3. Стекінг: Додаємо текстовий прогноз як нову фічу
+        X_struct = self._get_struct_matrix(train).copy()
+        X_struct["text_pred_log"] = text_preds
+
+        # Вказуємо, що category_id — це категоріальна фіча, а не звичайне число
+        cat_idx = [X_struct.columns.get_loc("category_id")]
+
+        # 4. Головна модель HistGradientBoosting
+        self.rf = HistGradientBoostingRegressor(
+            categorical_features=cat_idx,
+            max_iter=200,
+            learning_rate=0.06,
+            max_depth=12,
+            min_samples_leaf=5,
+            l2_regularization=1.0,
+            random_state=42
         )
         self.rf.fit(X_struct, y, sample_weight=weights)
 
         # Метрика
-        y_pred_log = 0.6 * self.ridge.predict(X_combined) + 0.4 * self.rf.predict(X_struct)
+        y_pred_log = self.rf.predict(X_struct)
         y_pred     = np.expm1(y_pred_log)
         y_real     = np.expm1(y)
         mape = mean_absolute_percentage_error(y_real, y_pred) * 100
         n    = len(train)
-        print(f"✅ Регресія навчена | Train MAPE: {mape:.1f}% | N={n:,} (sold+reserved+deleted)")
+        print(f"✅ ML (Stacking + Categorical) | Train MAPE: {mape:.1f}% | N={n:,}")
 
     def _ensure_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Додає потрібні фічі якщо відсутні (для reserved/deleted df)."""
         df = df.copy()
         if "text" not in df.columns:
             df["text"] = (df["title"].fillna("") + " " + df["description"].fillna("")).str.lower()
@@ -200,14 +201,16 @@ class PriceAnalyzer:
         df["has_brand"]  = df["text"].apply(lambda x: int(bool(BRAND_RE.search(x))))
         df["cond_good"]  = df["text"].apply(lambda x: int(bool(CONDITION_GOOD_RE.search(x))))
         df["cond_bad"]   = df["text"].apply(lambda x: int(bool(CONDITION_BAD_RE.search(x))))
-        df["category_id"] = df["category_id"].fillna(0)
+        if "category_id" not in df.columns:
+            df["category_id"] = 0
+        df["category_id"] = df["category_id"].fillna(0).astype(int)
 
         global_med = self.df["price"].median()
         cat_med    = self.df.groupby("category_id")["price"].median()
         df["cat_median"] = df["category_id"].map(cat_med).fillna(global_med)
         df["log_cat_median"] = np.log1p(df["cat_median"])
 
-        sold_med = self.df.groupby("category_id")["sold_price"].median()
+        sold_med = self.df.groupby("category_id")["sold_price"].median() if "sold_price" in self.df.columns else cat_med
         df["log_cat_sold_median"] = np.log1p(df["category_id"].map(sold_med).fillna(global_med))
 
         for col in ["condition_score", "keyword_score"]:
@@ -215,7 +218,7 @@ class PriceAnalyzer:
                 df[col] = 0.5
         for col in ["battery_pct", "memory_gb", "has_specs"]:
             if col not in df.columns:
-                df[col] = 0
+                df[col] = np.nan
         return df
 
     # ── 2. Predict ────────────────────────────────────────────────────────────
@@ -231,7 +234,7 @@ class PriceAnalyzer:
             if cat_id in self.df["category_id"].values
             else self.df["price"].median()
         )
-        sold_med = cat_med  # оскільки sold_price майже немає
+        sold_med = cat_med
 
         text = description.lower()
         row = {
@@ -241,28 +244,30 @@ class PriceAnalyzer:
             "cond_good": int(bool(CONDITION_GOOD_RE.search(text))),
             "cond_bad": int(bool(CONDITION_BAD_RE.search(text))),
             "word_count": len(description.split()),
-            "category_id": cat_id,
+            "category_id": int(cat_id),
             "log_cat_median": np.log1p(cat_med),
             "log_cat_sold_median": np.log1p(sold_med),
             "condition_score": _cond_score(text),
             "keyword_score": 0.5,
-            "battery_pct": _extract_num(text, r'батаре[яї]\s*[:\-]?\s*(\d{2,3})\s*%', 0),
-            "memory_gb": _extract_num(text, r'(\d+)\s*(?:гб|gb)\b', 0),
+            "battery_pct": _extract_num(text, r'батаре[яї]\s*[:\-]?\s*(\d{2,3})\s*%', np.nan),
+            "memory_gb": _extract_num(text, r'(\d+)\s*(?:гб|gb)\b', np.nan),
             "has_specs": int(bool(re.search(r'\d+\s*(?:gb|гб|%)', text, re.I))),
         }
-        X_struct = pd.DataFrame([row])
-        X_tfidf = self.tfidf.transform([text])
-        X_combined = hstack([csr_matrix(X_struct.values), X_tfidf])
 
-        ridge_log = float(self.ridge.predict(X_combined)[0])
-        rf_log = float(self.rf.predict(X_struct)[0])
-        pred_log = 0.6 * ridge_log + 0.4 * rf_log
+        # 1. Прогноз по тексту
+        X_tfidf = self.tfidf.transform([text])
+        text_pred_log = float(self.ridge.predict(X_tfidf)[0])
+
+        # 2. Додаємо текстовий прогноз до структури
+        X_struct = pd.DataFrame([row])
+        X_struct["text_pred_log"] = text_pred_log
+
+        # 3. Фінальний прогноз
+        pred_log = float(self.rf.predict(X_struct)[0])
         pred = float(np.expm1(pred_log))
 
-        # === ВАЖЛИВІ КОРЕКЦІЇ ===
         if cat_id == 1261:  # Телефони
-            pred = pred * 1.55   # сильний буст для Apple
-            # Мінімальний поріг
+            pred = pred * 1.55
             min_price = max(3200, cat_med * 0.75)
             pred = max(pred, min_price)
 
@@ -273,7 +278,6 @@ class PriceAnalyzer:
     def classify_strategy(self, recommended_price, category_id=None):
         cat_id = category_id or 0
 
-        # Базова вибірка: sold + reserved (обидва сигналізують "ціна ОК")
         sold = self.df[
             (self.df["category_id"] == cat_id) &
             self.df["sold_price"].notna()
@@ -284,7 +288,6 @@ class PriceAnalyzer:
             mask = self.reserved_df["category_id"] == cat_id
             reserved_prices = self.reserved_df[mask]["original_price"].dropna()
 
-        # Об'єднуємо sold і reserved з вагою
         all_success = pd.concat([sold, reserved_prices])
         prices = all_success if len(all_success) >= 10 else \
                  self.df[self.df["category_id"] == cat_id]["price"]
@@ -294,7 +297,6 @@ class PriceAnalyzer:
         else:
             pct = float((prices < recommended_price).mean())
 
-        # Середній дисконт по категорії
         cat_discount = self.df[
             (self.df["category_id"] == cat_id) &
             self.df["discount_rate"].notna()
@@ -341,7 +343,6 @@ class PriceAnalyzer:
         return self.find_comparables(query, category_id, top_k, source_df=self.fast_sold)
 
     def find_reserved_comparables(self, query: str, category_id=None, top_k=5):
-        """Компаративи з RESERVED — додатковий сигнал довіри."""
         if self.reserved_df.empty:
             return pd.DataFrame()
         return self.find_comparables(query, category_id, top_k, source_df=self.reserved_df)
@@ -383,17 +384,12 @@ class PriceAnalyzer:
     # ── 6. Нові методи для UI ─────────────────────────────────────────────────
 
     def market_speed_info(self, category_id: Optional[int] = None) -> Dict:
-        """
-        Індикатор швидкості ринку для UI.
-        Повертає: середній час продажу, кількість активних, рівень конкуренції.
-        """
         cat_id = category_id or 0
         cat_df = self.df[self.df["category_id"] == cat_id] if cat_id else self.df
 
         active_count = len(cat_df)
         avg_days     = float(cat_df["cat_days_median"].median()) if "cat_days_median" in cat_df.columns else 30
 
-        # RESERVED як % від активних = швидкість ринку
         reserved_count = 0
         if not self.reserved_df.empty:
             reserved_count = len(
@@ -421,10 +417,6 @@ class PriceAnalyzer:
         price: float,
         category_id: Optional[int] = None,
     ) -> Dict:
-        """
-        Де знаходиться ціна відносно ринку — для прогрес-бару в UI.
-        Повертає percentile, лейбл і рекомендацію.
-        """
         cat_id = category_id or 0
         cat_df = self.df[self.df["category_id"] == cat_id] if cat_id else self.df
 
@@ -469,10 +461,6 @@ class PriceAnalyzer:
         category_id: Optional[int] = None,
         recommended_price: float = 0,
     ) -> Dict:
-        """
-        Блок довіри для UI: активні + продані + зарезервовані компаративи.
-        Повертає структурований dict для фронтенду.
-        """
         active_comps   = self.find_comparables(query, category_id, top_k=5)
         sold_comps     = self.find_fast_sold_comparables(query, category_id, top_k=3)
         reserved_comps = self.find_reserved_comparables(query, category_id, top_k=3)
