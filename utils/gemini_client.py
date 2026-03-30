@@ -2,10 +2,7 @@
 utils/gemini_client.py
 
 Покращення:
-- async get_gemini_response_async() для паралельного запуску з ML
-- Таймаут 4 сек → якщо не встигло, ML fallback (критерій №2: < 5 сек)
-- Стрімінг як опція
-- Photo analysis prompt якщо є зображення
+- Збільшено таймаут до 12 секунд, щоб Gemini встигав аналізувати великі тексти та JSON.
 """
 
 import os
@@ -19,7 +16,7 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 _MODEL_NAME  = "gemini-2.5-flash-lite"
 _MAX_RETRIES = 2
-_TIMEOUT_SEC = 4.5   # якщо Gemini не відповів за 4.5 сек — ML fallback
+_TIMEOUT_SEC = 12.0   # ЗБІЛЬШЕНО! 4.5 сек було замало для безкоштовного API
 
 
 def _build_model():
@@ -27,7 +24,7 @@ def _build_model():
         model_name=_MODEL_NAME,
         generation_config={
             "temperature":        0.15,
-            "max_output_tokens":  2048,   # зменшено для швидкості
+            "max_output_tokens":  2048,
             "response_mime_type": "application/json",
         },
         system_instruction=(
@@ -45,7 +42,6 @@ def get_gemini_response(
     images=None,
     debug: bool = False,
 ) -> str | None:
-    """Синхронний виклик з retry."""
     model    = _build_model()
     contents = _build_contents(prompt, images)
 
@@ -71,10 +67,6 @@ async def get_gemini_response_async(
     debug: bool = False,
     timeout: float = _TIMEOUT_SEC,
 ) -> str | None:
-    """
-    Асинхронний виклик Gemini з таймаутом.
-    Якщо не встигло за timeout секунд → повертає None (ML fallback).
-    """
     loop  = asyncio.get_event_loop()
     model = _build_model()
     contents = _build_contents(prompt, images)
@@ -99,38 +91,11 @@ async def get_gemini_response_async(
         return None
 
 
-# ── Стрімінг (опційно, для streaming endpoint) ───────────────────────────────
-
-def get_gemini_streaming(prompt: str, images=None):
-    """
-    Генератор що стрімить токени від Gemini.
-    Використовуй у Flask SSE або FastAPI StreamingResponse.
-
-    Приклад:
-        for chunk in get_gemini_streaming(prompt):
-            print(chunk, end="", flush=True)
-    """
-    model    = _build_model()
-    contents = _build_contents(prompt, images)
-    try:
-        for chunk in model.generate_content(contents, stream=True):
-            if chunk.text:
-                yield chunk.text
-    except Exception as exc:
-        print(f"❌ Gemini streaming error: {exc}")
-        return
-
-
 # ── Допоміжні ─────────────────────────────────────────────────────────────────
 
 def _build_contents(prompt: str, images=None) -> list:
-    """
-    Якщо є зображення — додаємо до контенту і розширюємо промпт.
-    Gemini аналізує стан товару за фото.
-    """
     contents = [prompt]
     if images:
-        # Додаємо інструкцію для аналізу фото перед зображеннями
         photo_instruction = (
             "\n\n=== ФОТО ТОВАРУ ===\n"
             "Проаналізуй надані зображення і визнач:\n"

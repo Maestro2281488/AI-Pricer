@@ -111,7 +111,7 @@ class PriceAgent:
 
         # ── Паралельний виклик Gemini ─────────────────────────────────────────
         print("⚡ Паралельний запуск ML + Gemini...")
-        raw = await get_gemini_response_async(prompt, images, debug=debug, timeout=4.5)
+        raw = await get_gemini_response_async(prompt, images, debug=debug, timeout=12)
 
         if raw:
             parsed = _parse_json(raw)

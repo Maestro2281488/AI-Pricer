@@ -1,6 +1,6 @@
 """
 utils/data_loader.py
-Адаптовано під файл advertisements_for_hackaton.csv (без заголовків)
+Оновлено під актуальний файл hackaton_advertisements_with_id.csv (з 10 колонками)
 """
 
 import os
@@ -25,26 +25,35 @@ CONDITION_BAD = [
 PRICE_QUANTILES = (0.33, 0.66)
 
 
-def load_dataset(path: str = "data/advertisements_for_hackaton.csv"):
+def load_dataset(path: str = "data/hackaton_advertisements_with_id.csv"):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Файл не знайдено: {path}")
 
-    # Завантажуємо файл БЕЗ заголовків
-    df = pd.read_csv(path, header=None, low_memory=False)
+    # Завантажуємо актуальний файл (з заголовками)
+    df = pd.read_csv(path, low_memory=False)
 
-    # Присвоюємо правильні назви колонок
-    df.columns = ['id', 'status', 'title', 'description', 'original_price',
-                  'created_at', 'modified_at', 'category_id']
+    # Очищаємо пробіли в назвах колонок
+    df.columns = df.columns.str.strip()
 
-    print(f"✅ Завантажено {len(df):,} рядків з файлу без заголовків")
+    # Підлаштовуємо під очікування коду тіммейта (id замість advertisement_id)
+    if 'advertisement_id' in df.columns:
+        df.rename(columns={'advertisement_id': 'id'}, inplace=True)
+
+    print(f"✅ Завантажено {len(df):,} рядків з актуального файлу")
 
     # Конвертація типів
     df["original_price"] = pd.to_numeric(df["original_price"], errors="coerce")
-    df["sold_price"] = np.nan                    # в цьому датасеті sold_price немає
+
+    if "sold_price" in df.columns:
+        df["sold_price"] = pd.to_numeric(df["sold_price"], errors="coerce")
+    else:
+        df["sold_price"] = np.nan
+
     df["category_id"] = pd.to_numeric(df["category_id"], errors="coerce")
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
     df["modified_at"] = pd.to_datetime(df["modified_at"], errors="coerce")
 
+    # Основна ціна для ML: sold_price якщо є, інакше original_price
     df["price"] = df["sold_price"].fillna(df["original_price"])
 
     total = len(df)
@@ -82,9 +91,19 @@ def _enrich(df: pd.DataFrame):
     df["desc_len"] = df["description"].fillna("").str.len()
     df["title_len"] = df["title"].fillna("").str.len()
     df["has_brand"] = df["text"].apply(_has_brand).astype(int)
-    df["was_bargained"] = 0  # немає даних
 
-    df["price_discount"] = 0.0
+    # Відновлюємо колонки торгу, оскільки новий датасет їх має
+    if "sold_via_bargain" in df.columns:
+        df["was_bargained"] = df["sold_via_bargain"].fillna(False).astype(int)
+    else:
+        df["was_bargained"] = 0
+
+    if "sold_price" in df.columns:
+        df["price_discount"] = (
+            (df["original_price"] - df["sold_price"]) / df["original_price"].replace(0, np.nan)
+        ).fillna(0).clip(0, 1)
+    else:
+        df["price_discount"] = 0.0
 
     df["keyword_score"] = _keyword_score_per_category(df)
     df["price_label"] = _label_price(df)
@@ -94,7 +113,7 @@ def _enrich(df: pd.DataFrame):
     days_old = (now - df["created_at"]).dt.days.clip(0, 365).fillna(180)
     df["recency_weight"] = np.exp(-days_old / 30)
 
-    # Окрема медіана проданих (sold_price немає — використовуємо original_price)
+    # Окрема медіана проданих (використовуємо price, який вже враховує sold_price)
     sold_med = (
         df.groupby("category_id")["price"]
         .transform("median")
