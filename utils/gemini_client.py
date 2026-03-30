@@ -2,7 +2,9 @@
 utils/gemini_client.py
 
 Покращення:
-- Збільшено таймаут до 12 секунд, щоб Gemini встигав аналізувати великі тексти та JSON.
+- Впроваджено Strict JSON Schema для гарантованої структури відповіді.
+- Додано жорсткий детермінізм (temperature=0.0, top_k=1, top_p=0.1).
+- Оновлено SYSTEM_PROMPT з акцентом на компаративи.
 """
 
 import os
@@ -16,24 +18,70 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 _MODEL_NAME  = "gemini-2.5-flash-lite"
 _MAX_RETRIES = 2
-_TIMEOUT_SEC = 12.0   # ЗБІЛЬШЕНО! 4.5 сек було замало для безкоштовного API
-
+_TIMEOUT_SEC = 12.0
 
 def _build_model():
+    # Визначаємо жорстку схему JSON (Structured Outputs)
+    response_schema = {
+        "type": "OBJECT",
+        "properties": {
+            "recommended_price": {"type": "INTEGER"},
+            "price_range": {
+                "type": "OBJECT",
+                "properties": {
+                    "min": {"type": "INTEGER"},
+                    "max": {"type": "INTEGER"}
+                },
+                "required": ["min", "max"]
+            },
+            "strategies": {
+                "type": "OBJECT",
+                "properties": {
+                    "FAST": {"type": "INTEGER"},
+                    "BALANCED": {"type": "INTEGER"},
+                    "MAX_PROFIT": {"type": "INTEGER"}
+                },
+                "required": ["FAST", "BALANCED", "MAX_PROFIT"]
+            },
+            "explanation": {"type": "STRING"},
+            "key_factors": {
+                "type": "ARRAY",
+                "items": {"type": "STRING"}
+            },
+            "advice": {"type": "STRING"}
+        },
+        "required": [
+            "recommended_price", "price_range", "strategies",
+            "explanation", "key_factors", "advice"
+        ]
+    }
+
+    # Твій покращений промпт англійською
+    system_instruction = (
+        "You are a professional AI pricer for the 'monobazar' platform within the monobank app. "
+        "Your goal is to help sellers set a fair market price for used goods. "
+        "You receive a product description, ML model forecast, and real examples of sold items (comparables). "
+        "\n\nSTRICT RULES:\n"
+        "1. Always be objective and rely on comparables data.\n"
+        "2. Formulate 3 strategies: FAST, BALANCED, MAX_PROFIT.\n"
+        "3. If the ML model provides an unrealistic price (significantly different from comparables), "
+        "ignore it and trust real sales data.\n"
+        "4. Your response must be EXCLUSIVELY in a valid JSON format. No markdown, no extra text.\n"
+        "5. Respond ONLY in Ukrainian."
+    )
+
     return genai.GenerativeModel(
         model_name=_MODEL_NAME,
         generation_config={
-            "temperature":        0.15,
-            "max_output_tokens":  2048,
+            "temperature": 0.0,  # Мінімум випадковості
+            "top_p": 0.1,
+            "top_k": 1,
+            "max_output_tokens": 2048,
             "response_mime_type": "application/json",
+            "response_schema": response_schema, # Підключення схеми
         },
-        system_instruction=(
-            "You are a JSON-only pricing API. "
-            "Never output any text outside the JSON object. "
-            "Be concise — explanation max 2 sentences, advice max 2 sentences."
-        ),
+        system_instruction=system_instruction,
     )
-
 
 # ── Синхронний виклик ─────────────────────────────────────────────────────────
 
@@ -50,14 +98,13 @@ def get_gemini_response(
             response = model.generate_content(contents)
             text = response.text.strip()
             if debug:
-                print(f"🔍 Gemini raw ({len(text)} chars): {text[:400]}")
+                print(f"🔍 Gemini raw: {text[:400]}")
             return text
         except Exception as exc:
             print(f"❌ Gemini error attempt {attempt}: {exc}")
             if attempt <= _MAX_RETRIES:
                 time.sleep(2 ** attempt)
     return None
-
 
 # ── Асинхронний виклик з таймаутом ───────────────────────────────────────────
 
@@ -83,13 +130,10 @@ async def get_gemini_response_async(
             loop.run_in_executor(None, _call),
             timeout=timeout,
         )
-        if debug and result:
-            print(f"🔍 Gemini async raw ({len(result)} chars): {result[:400]}")
         return result
     except asyncio.TimeoutError:
-        print(f"⏱ Gemini timeout ({timeout}s) — використовуємо ML fallback")
+        print(f"⏱ Gemini timeout ({timeout}s) — використовую ML fallback")
         return None
-
 
 # ── Допоміжні ─────────────────────────────────────────────────────────────────
 
@@ -97,12 +141,11 @@ def _build_contents(prompt: str, images=None) -> list:
     contents = [prompt]
     if images:
         photo_instruction = (
-            "\n\n=== ФОТО ТОВАРУ ===\n"
-            "Проаналізуй надані зображення і визнач:\n"
-            "1. Видимий стан (подряпини, потертості, дефекти)\n"
-            "2. Комплектність (коробка, аксесуари)\n"
-            "3. Відповідність опису\n"
-            "Врахуй це у своїй оцінці ціни.\n"
+            "\n\n=== PRODUCT PHOTOS ===\n"
+            "Analyze these images to determine:\n"
+            "1. Visual condition (scratches, wear, defects).\n"
+            "2. Completeness (box, accessories).\n"
+            "3. Consistency with the description.\n"
         )
         contents[0] = prompt + photo_instruction
         contents.extend(images)
