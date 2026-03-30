@@ -23,6 +23,7 @@ from utils.data_loader   import load_dataset
 from utils.price_analyzer import PriceAnalyzer
 from utils.gemini_client  import get_gemini_response, get_gemini_response_async
 
+import pandas as pd
 
 class PriceAgent:
 
@@ -37,6 +38,8 @@ class PriceAgent:
             self.deleted_df,
         )
 
+        self.photos_df = pd.read_csv("data/advertisement_photos.csv")
+
     # ── Головний синхронний метод ─────────────────────────────────────────────
 
     def price_item(
@@ -46,6 +49,7 @@ class PriceAgent:
         category_id: Optional[int] = None,
         debug: bool = False,
         fast_mode: bool = True,   # True = паралельний запуск ML+Gemini
+        advertisement_id: Optional[str] = None
     ) -> dict:
         """
         Parameters
@@ -65,7 +69,7 @@ class PriceAgent:
         if fast_mode:
             try:
                 return asyncio.run(
-                    self._price_item_async(description, images, category_id, debug)
+                    self._price_item_async(description, images, category_id, debug, advertisement_id)
                 )
             except RuntimeError:
                 # Вже є event loop (напр. в Jupyter) — fallback до синхронного
@@ -86,6 +90,7 @@ class PriceAgent:
         images=None,
         category_id: Optional[int] = None,
         debug: bool = False,
+        advertisement_id: Optional[str] = None
     ) -> dict:
         """
         1. ML запускається відразу (синхронно, ~0.1–0.5 сек)
@@ -97,6 +102,9 @@ class PriceAgent:
         ml_result = self._compute_ml(description, category_id)
         regression_price = ml_result["recommended_price"]
         strategies_ml    = ml_result["strategies_raw"]
+
+        if images is None and advertisement_id:
+            images = await asyncio.get_event_loop().run_in_executor(None, self._load_photos, advertisement_id)
 
         # ── Промпт ───────────────────────────────────────────────────────────
         prompt = self._build_prompt(description, category_id, regression_price, strategies_ml)
@@ -119,6 +127,33 @@ class PriceAgent:
         # ── ML fallback ───────────────────────────────────────────────────────
         print("⚡ ML fallback (Gemini не встиг або помилка)")
         return self._enrich_result(ml_result, description, category_id, regression_price)
+
+    def _load_photos(self, advertisement_id: str, max_photos: int = 2) -> list:
+        import requests
+        from PIL import Image
+        from io import BytesIO
+
+        keys = self.photos_df[
+            self.photos_df["advertisement_id"] == advertisement_id
+        ]["s3_key"].tolist()[:max_photos]
+
+        images = []
+        for key in keys:
+            try:
+                r = requests.get(
+                    f"https://resale-media.monobazar.com.ua/{key}",
+                    timeout=2
+                )
+                if r.status_code == 200:
+                    img = Image.open(BytesIO(r.content))
+                    img.load()  # форсує повне зчитування
+                    img.thumbnail((512, 512))
+                    images.append(img)
+            except Exception as e:
+                print(f"⚠ Фото {key[:8]}: {e}")
+
+        print(f"📸 Завантажено {len(images)} фото для {advertisement_id[:8]}...")
+        return images if images else None
 
     # ── Синхронний pipeline (fast_mode=False) ────────────────────────────────
 
@@ -260,7 +295,7 @@ class PriceAgent:
         maxp    = strategies_ml.get("MAX_PROFIT", regression_price)
         label   = strategies_ml.get("_label", "medium")
 
-        return f"""Ти — AI-прайсер для monopricehelper (б/у маркетплейс, Україна).
+        return f"""Ти — AI-прайсер для monopricehelper (б/у маркетплейс, Україна). Відповідай ТІЛЬКИ українською мовою.
 Відповідь: ТІЛЬКИ JSON, без markdown, без коментарів.
 
 === ОПИС ТОВАРУ ===

@@ -16,7 +16,7 @@ agent = PriceAgent()
 print("\n" + "=" * 70)
 
 
-def run_example(label: str, description: str, category_id=None):
+def run_example(label: str, description: str, category_id=None, advertisement_id = None):
     print(f"\n{label}")
     t0 = time.time()
     result = agent.price_item(
@@ -24,6 +24,7 @@ def run_example(label: str, description: str, category_id=None):
         category_id=category_id,
         fast_mode=True,
         debug=False,
+        advertisement_id=advertisement_id
     )
     elapsed = time.time() - t0
     print(f"⏱ Час: {elapsed:.2f}с | Джерело: {result.get('_source', '?')}")
@@ -76,6 +77,7 @@ run_example(
     Відправка Новою Поштою за передоплатою 300 грн.
     """,
     category_id=795,
+    advertisement_id="d4b086a2-2697-45f3-b398-b2500359ff1b",  # Джейн Ейр з датасету
 )
 
 # ── Приклад 2: Кросівки (категорія 512) ──────────────────────────────────────
@@ -87,6 +89,7 @@ run_example(
     Куплені в США, є чек. Відправка після передоплати.
     """,
     category_id=512,
+    advertisement_id="a4363913-69e7-4e2e-97b7-ad3b13e6ba28",  # Nike Tiempo з датасету
 )
 
 # ── Приклад 3: Телефон (категорія 1261) ──────────────────────────────────────
@@ -96,7 +99,8 @@ run_example(
     iPhone 13 Pro 256GB Sierra Blue. Стан гарний, є невеликі подряпини на корпусі.
     Комплект: коробка, кабель. Батарея 87%. Face ID працює ідеально. NeverLock.
     """,
-    category_id=1261,
+    category_id=4,
+    advertisement_id="00014026-c305-46fd-96f0-6ac4e38e96b51",  # iPhone 14 Pro з датасету
 )
 
 print("✅ Готово!")

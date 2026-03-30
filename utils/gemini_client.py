@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-_MODEL_NAME  = "gemini-2.5-flash"
+_MODEL_NAME  = "gemini-2.5-flash-lite"
 _MAX_RETRIES = 2
 _TIMEOUT_SEC = 4.5   # якщо Gemini не відповів за 4.5 сек — ML fallback
 
