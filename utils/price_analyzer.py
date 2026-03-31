@@ -1,22 +1,19 @@
 """
 utils/price_analyzer.py
 
-Покращення ML (v3 - Stacking & Categorical Features):
+Покращення ML (v6 - Ultimate: Advanced Features + FAISS Semantic Search + Urgency + KNN Feature):
 - Stacking: Ridge (текст) -> HistGradientBoosting (структура).
-- Категоріальні фічі: category_id тепер обробляється нативно.
-- Розумні викиди: видалення топ-2% найдорожчих товарів всередині кожної категорії.
-
-🔥 ДОДАНО (v4):
-- Векторний пошук (Semantic Search) на базі FAISS + SentenceTransformers
-- Кешування ембедингів (faiss_index.bin) для миттєвого запуску.
+- Нові фічі: brand_code, cat_bargain_prob, created_month, created_dow, cat_price_std, is_urgent.
+- Векторний пошук (Semantic Search) на базі FAISS + SentenceTransformers.
+- 🔥 KNN Feature: Використання медіани цін від FAISS як фічі для регресії (без Data Leakage).
 """
 
-import re
 import os
+import re
 import numpy as np
 import pandas as pd
 from collections import Counter
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import HistGradientBoostingRegressor
@@ -39,6 +36,10 @@ CONDITION_BAD_RE = re.compile(
     r"б/у|вживан|подряпин|потертост|пошкодж|зламан|не працює|тріщин|дефект|worn|damaged",
     re.I,
 )
+URGENCY_RE = re.compile(
+    r"термінов|торг|швидкий продаж|швидко віддам|зв'язку з переїзд|через переїзд|торг доречний",
+    re.I,
+)
 
 
 class PriceAnalyzer:
@@ -55,9 +56,14 @@ class PriceAnalyzer:
         self.reserved_df = reserved_df if reserved_df is not None else pd.DataFrame()
         self.deleted_df  = deleted_df  if deleted_df  is not None else pd.DataFrame()
 
+        # Зберігаємо мапінги для нових фічей
+        self.brand_mapping = {}
+        self.cat_bargain_prob_map = {}
+        self.cat_price_std_map = {}
+
         self._build_features()
+        self._init_vector_search() # Спочатку FAISS (він потрібен для регресії)
         self._train_regression()
-        self._init_vector_search() # 🔥 Ініціалізація FAISS
 
     # ── Ініціалізація Векторного Пошуку (FAISS) ──────────────────────────────
 
@@ -67,7 +73,6 @@ class PriceAnalyzer:
             import faiss
 
             print("🚀 Ініціалізація Векторного Пошуку (Semantic Search)...")
-            # Швидка мультимовна модель (ідеально розуміє українську)
             self.embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
             index_file = "faiss_index.bin"
@@ -79,12 +84,10 @@ class PriceAnalyzer:
                 print("⏳ Створення FAISS індексу (1-2 хв, тільки при першому запуску!)...")
                 texts = self.df["text"].fillna("").tolist()
 
-                # Кодуємо всі тексти у вектори
                 embeddings = self.embedder.encode(texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True)
 
-                # Нормалізуємо для Cosine Similarity
                 faiss.normalize_L2(embeddings)
-                self.index = faiss.IndexFlatIP(embeddings.shape[1]) # Inner Product (Косинусна подібність)
+                self.index = faiss.IndexFlatIP(embeddings.shape[1])
                 self.index.add(embeddings)
 
                 faiss.write_index(self.index, index_file)
@@ -94,6 +97,31 @@ class PriceAnalyzer:
         except ImportError:
             self.use_vector_search = False
             print("⚠️ FAISS або SentenceTransformers не знайдені. Працюємо на класичному Keyword Overlap.")
+
+    def _get_faiss_price_batch(self, texts: List[str], fallbacks: List[float]) -> List[float]:
+        """Отримує медіанну ціну схожих товарів від FAISS, уникаючи Data Leakage."""
+        if not getattr(self, "use_vector_search", False):
+            return fallbacks
+
+        emb = self.embedder.encode(texts, batch_size=64, show_progress_bar=False, convert_to_numpy=True)
+        import faiss
+        faiss.normalize_L2(emb)
+        distances, indices = self.index.search(emb, 6) # Шукаємо топ-6
+
+        faiss_prices = []
+        for i in range(len(texts)):
+            # Відкидаємо точні копії (відстань > 0.99), щоб уникнути витоку ціни в тренувальний датасет
+            valid_idx = [idx for j, idx in enumerate(indices[i]) if distances[i][j] < 0.99]
+            if not valid_idx:
+                valid_idx = indices[i][:5]
+
+            prices = self.df.iloc[valid_idx]["price"].dropna()
+            if not prices.empty:
+                faiss_prices.append(prices.median())
+            else:
+                faiss_prices.append(fallbacks[i])
+
+        return faiss_prices
 
     # ── Feature engineering ───────────────────────────────────────────────────
 
@@ -108,7 +136,28 @@ class PriceAnalyzer:
         d["has_brand"]  = d["text"].apply(lambda x: int(bool(BRAND_RE.search(x))))
         d["cond_good"]  = d["text"].apply(lambda x: int(bool(CONDITION_GOOD_RE.search(x))))
         d["cond_bad"]   = d["text"].apply(lambda x: int(bool(CONDITION_BAD_RE.search(x))))
+        d["is_urgent"]  = d["text"].apply(lambda x: int(bool(URGENCY_RE.search(x))))
         d["category_id"] = d["category_id"].fillna(0).astype(int)
+
+        d["brand_name"] = d["text"].apply(_extract_brand)
+        self.brand_mapping = {b: i for i, b in enumerate(d["brand_name"].unique())}
+        d["brand_code"] = d["brand_name"].map(self.brand_mapping)
+
+        if "sold_via_bargain" in d.columns:
+            d["bargain_numeric"] = pd.to_numeric(d["sold_via_bargain"], errors="coerce").fillna(0)
+            self.cat_bargain_prob_map = d.groupby("category_id")["bargain_numeric"].mean().to_dict()
+        d["cat_bargain_prob"] = d["category_id"].map(self.cat_bargain_prob_map).fillna(0.0)
+
+        if "created_at" in d.columns:
+            d["created_month"] = d["created_at"].dt.month.fillna(6).astype(int)
+            d["created_dow"]   = d["created_at"].dt.dayofweek.fillna(3).astype(int)
+        else:
+            now = pd.Timestamp.now(tz="UTC")
+            d["created_month"] = now.month
+            d["created_dow"]   = now.dayofweek
+
+        self.cat_price_std_map = d.groupby("category_id")["price"].std().fillna(0).to_dict()
+        d["cat_price_std"] = d["category_id"].map(self.cat_price_std_map).fillna(0.0)
 
         cat_med = d.groupby("category_id")["price"].transform("median")
         d["cat_median"]     = cat_med.fillna(d["price"].median())
@@ -142,10 +191,12 @@ class PriceAnalyzer:
 
     def _structural_features(self) -> List[str]:
         return [
-            "desc_len", "title_len", "has_brand",
-            "cond_good", "cond_bad", "word_count",
-            "category_id", "log_cat_median", "log_cat_sold_median",
-            "condition_score", "keyword_score",
+            "desc_len", "title_len", "has_brand", "brand_code",
+            "cond_good", "cond_bad", "word_count", "is_urgent",
+            "category_id", "log_cat_median", "log_cat_sold_median", "cat_price_std",
+            "faiss_median_price", # 🔥 Нова супер-фіча!
+            "condition_score", "keyword_score", "cat_bargain_prob",
+            "created_month", "created_dow",
             "battery_pct", "memory_gb", "has_specs",
         ]
 
@@ -181,9 +232,13 @@ class PriceAnalyzer:
         train = pd.concat(frames, ignore_index=True)
         train = train[train["_target"].notna() & (train["_target"] > 0)]
 
-        # Розумні викиди
         q98_per_cat = train.groupby("category_id")["_target"].transform(lambda x: x.quantile(0.98))
         train = train[train["_target"] <= q98_per_cat]
+
+        # 🔥 Розраховуємо FAISS-ціни для тренувальної вибірки (забере ~3 секунди)
+        texts = train["text"].fillna("").tolist()
+        fallbacks = train["cat_median"].tolist()
+        train["faiss_median_price"] = self._get_faiss_price_batch(texts, fallbacks)
 
         y       = np.log1p(train["_target"])
         weights = train["_weight"].values
@@ -202,7 +257,8 @@ class PriceAnalyzer:
         X_struct = self._get_struct_matrix(train).copy()
         X_struct["text_pred_log"] = text_preds
 
-        cat_idx = [X_struct.columns.get_loc("category_id")]
+        cat_cols = ["category_id", "brand_code", "created_month", "created_dow"]
+        cat_idx = [X_struct.columns.get_loc(c) for c in cat_cols]
 
         self.rf = HistGradientBoostingRegressor(
             categorical_features=cat_idx,
@@ -220,7 +276,7 @@ class PriceAnalyzer:
         y_real     = np.expm1(y)
         mape = mean_absolute_percentage_error(y_real, y_pred) * 100
         n    = len(train)
-        print(f"✅ ML (Stacking + Categorical) | Train MAPE: {mape:.1f}% | N={n:,}")
+        print(f"✅ ML (Ultimate: Stacking + KNN FAISS) | Train MAPE: {mape:.1f}% | N={n:,}")
 
     def _ensure_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
@@ -230,11 +286,27 @@ class PriceAnalyzer:
         df["title_len"]  = df["title"].fillna("").str.len()
         df["word_count"] = df["description"].fillna("").str.split().str.len()
         df["has_brand"]  = df["text"].apply(lambda x: int(bool(BRAND_RE.search(x))))
+
+        df["brand_code"] = df["text"].apply(_extract_brand).map(self.brand_mapping).fillna(-1).astype(int)
+
         df["cond_good"]  = df["text"].apply(lambda x: int(bool(CONDITION_GOOD_RE.search(x))))
         df["cond_bad"]   = df["text"].apply(lambda x: int(bool(CONDITION_BAD_RE.search(x))))
+        df["is_urgent"]  = df["text"].apply(lambda x: int(bool(URGENCY_RE.search(x))))
+
         if "category_id" not in df.columns:
             df["category_id"] = 0
         df["category_id"] = df["category_id"].fillna(0).astype(int)
+
+        df["cat_bargain_prob"] = df["category_id"].map(self.cat_bargain_prob_map).fillna(0.0)
+        df["cat_price_std"]    = df["category_id"].map(self.cat_price_std_map).fillna(0.0)
+
+        if "created_at" in df.columns:
+            df["created_month"] = df["created_at"].dt.month.fillna(6).astype(int)
+            df["created_dow"]   = df["created_at"].dt.dayofweek.fillna(3).astype(int)
+        else:
+            now = pd.Timestamp.now(tz="UTC")
+            df["created_month"] = now.month
+            df["created_dow"]   = now.dayofweek
 
         global_med = self.df["price"].median()
         cat_med    = self.df.groupby("category_id")["price"].median()
@@ -268,18 +340,31 @@ class PriceAnalyzer:
         sold_med = cat_med
 
         text = description.lower()
+        now = pd.Timestamp.now(tz="UTC")
+        brand_name = _extract_brand(text)
+
+        # 🔥 Розраховуємо FAISS-ціну для запиту користувача
+        faiss_median_price = self._get_faiss_price_batch([text], [cat_med])[0]
+
         row = {
             "desc_len": len(description),
             "title_len": len(description.split()[:15]) * 6,
             "has_brand": int(bool(BRAND_RE.search(text))),
+            "brand_code": int(self.brand_mapping.get(brand_name, -1)),
             "cond_good": int(bool(CONDITION_GOOD_RE.search(text))),
             "cond_bad": int(bool(CONDITION_BAD_RE.search(text))),
             "word_count": len(description.split()),
+            "is_urgent": int(bool(URGENCY_RE.search(text))),
             "category_id": int(cat_id),
             "log_cat_median": np.log1p(cat_med),
             "log_cat_sold_median": np.log1p(sold_med),
+            "cat_price_std": float(self.cat_price_std_map.get(cat_id, 0.0)),
+            "faiss_median_price": float(faiss_median_price), # 🔥 Додаємо у словник
             "condition_score": _cond_score(text),
             "keyword_score": 0.5,
+            "cat_bargain_prob": float(self.cat_bargain_prob_map.get(cat_id, 0.0)),
+            "created_month": now.month,
+            "created_dow": now.dayofweek,
             "battery_pct": _extract_num(text, r'батаре[яї]\s*[:\-]?\s*(\d{2,3})\s*%', np.nan),
             "memory_gb": _extract_num(text, r'(\d+)\s*(?:гб|gb)\b', np.nan),
             "has_specs": int(bool(re.search(r'\d+\s*(?:gb|гб|%)', text, re.I))),
@@ -357,15 +442,12 @@ class PriceAnalyzer:
         if getattr(self, "use_vector_search", False):
             try:
                 import faiss
-                # Кодуємо запит користувача
                 query_emb = self.embedder.encode([query.lower()], convert_to_numpy=True)
                 faiss.normalize_L2(query_emb)
 
-                # Шукаємо з запасом (щоб потім можна було відфільтрувати по source_df/категорії)
                 search_k = min(top_k * 50, len(self.df))
                 distances, indices = self.index.search(query_emb, search_k)
 
-                # Знаходимо глобальні індекси і перетинаємо їх з нашою вузькою вибіркою (напр. тільки fast_sold)
                 global_indices = self.df.iloc[indices[0]].index
                 valid_indices = global_indices.intersection(df.index)
 
@@ -377,7 +459,6 @@ class PriceAnalyzer:
                     res = df.loc[valid_indices].head(top_k)
 
                 if len(res) > 0:
-                    # Перетворюємо 0.854 у 85 (відсоток схожості), щоб agent.py і Gemini розуміли
                     similarities = distances[0][:len(res)]
                     res["_sim"] = [int(s * 100) for s in similarities]
                     return res[["title", "price", "description", "category_id", "_sim"]]
@@ -558,6 +639,12 @@ class PriceAnalyzer:
 
 
 # ── Допоміжні ─────────────────────────────────────────────────────────────────
+
+def _extract_brand(text: str) -> str:
+    """Витягує назву бренду з тексту."""
+    m = BRAND_RE.search(text)
+    return m.group(0).lower() if m else "no_brand"
+
 
 def _cond_score(text: str) -> float:
     good = len(CONDITION_GOOD_RE.findall(text))
