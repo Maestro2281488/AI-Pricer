@@ -5,9 +5,14 @@ utils/price_analyzer.py
 - Stacking: Ridge (текст) -> HistGradientBoosting (структура).
 - Категоріальні фічі: category_id тепер обробляється нативно.
 - Розумні викиди: видалення топ-2% найдорожчих товарів всередині кожної категорії.
+
+🔥 ДОДАНО (v4):
+- Векторний пошук (Semantic Search) на базі FAISS + SentenceTransformers
+- Кешування ембедингів (faiss_index.bin) для миттєвого запуску.
 """
 
 import re
+import os
 import numpy as np
 import pandas as pd
 from collections import Counter
@@ -17,7 +22,6 @@ from sklearn.linear_model import Ridge
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import mean_absolute_percentage_error
-from scipy.sparse import hstack, csr_matrix
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -53,11 +57,51 @@ class PriceAnalyzer:
 
         self._build_features()
         self._train_regression()
+        self._init_vector_search() # 🔥 Ініціалізація FAISS
+
+    # ── Ініціалізація Векторного Пошуку (FAISS) ──────────────────────────────
+
+    def _init_vector_search(self):
+        try:
+            from sentence_transformers import SentenceTransformer
+            import faiss
+
+            print("🚀 Ініціалізація Векторного Пошуку (Semantic Search)...")
+            # Швидка мультимовна модель (ідеально розуміє українську)
+            self.embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+
+            index_file = "faiss_index.bin"
+            if os.path.exists(index_file):
+                print("⚡ Завантаження готового FAISS індексу...")
+                self.index = faiss.read_index(index_file)
+                self.use_vector_search = True
+            else:
+                print("⏳ Створення FAISS індексу (1-2 хв, тільки при першому запуску!)...")
+                texts = self.df["text"].fillna("").tolist()
+
+                # Кодуємо всі тексти у вектори
+                embeddings = self.embedder.encode(texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True)
+
+                # Нормалізуємо для Cosine Similarity
+                faiss.normalize_L2(embeddings)
+                self.index = faiss.IndexFlatIP(embeddings.shape[1]) # Inner Product (Косинусна подібність)
+                self.index.add(embeddings)
+
+                faiss.write_index(self.index, index_file)
+                print("✅ FAISS індекс успішно збережено!")
+                self.use_vector_search = True
+
+        except ImportError:
+            self.use_vector_search = False
+            print("⚠️ FAISS або SentenceTransformers не знайдені. Працюємо на класичному Keyword Overlap.")
 
     # ── Feature engineering ───────────────────────────────────────────────────
 
     def _build_features(self):
         d = self.df
+        if "text" not in d.columns:
+            d["text"] = (d["title"].fillna("") + " " + d["description"].fillna("")).str.lower()
+
         d["desc_len"]   = d["description"].fillna("").str.len()
         d["title_len"]  = d["title"].fillna("").str.len()
         d["word_count"] = d["description"].fillna("").str.split().str.len()
@@ -92,7 +136,6 @@ class PriceAnalyzer:
             days_old = (now - d["created_at"]).dt.days.clip(0, 365).fillna(180)
             d["recency_weight"] = np.exp(-days_old / 30)
 
-        # Specs (навмисно залишаємо NaN, HistGradientBoosting вміє з ними працювати)
         for col in ["battery_pct", "memory_gb", "item_year", "has_specs"]:
             if col not in d.columns:
                 d[col] = np.nan
@@ -107,7 +150,6 @@ class PriceAnalyzer:
         ]
 
     def _get_struct_matrix(self, df_slice: pd.DataFrame) -> pd.DataFrame:
-        # Не робимо fillna(0) для всіх, бо 0 пам'яті і невідома пам'ять — це різне!
         return df_slice[self._structural_features()]
 
     # ── 1. Регресія ───────────────────────────────────────────────────────────
@@ -115,16 +157,13 @@ class PriceAnalyzer:
     def _train_regression(self):
         frames = []
 
-        # ── Продані (основне джерело) ──
         if self.fast_sold is not None and not self.fast_sold.empty:
             sold = self.fast_sold.copy()
             sold = self._ensure_features(sold)
-            # Використовуємо sold_price, якщо його немає — original_price
             sold["_target"] = sold["sold_price"].fillna(sold["original_price"])
             sold["_weight"] = 3.0
             frames.append(sold)
 
-        # ── RESERVED / ORDER_PROCESSING ──
         if not self.reserved_df.empty:
             res = self.reserved_df.copy()
             res = self._ensure_features(res)
@@ -132,7 +171,6 @@ class PriceAnalyzer:
             res["_weight"] = 2.0
             frames.append(res)
 
-        # ── ACTIVE (Семпл) ──
         n_sample = min(4000, len(self.df))
         if n_sample > 0:
             active_sample = self.df.sample(n=n_sample, random_state=42).copy()
@@ -143,14 +181,13 @@ class PriceAnalyzer:
         train = pd.concat(frames, ignore_index=True)
         train = train[train["_target"].notna() & (train["_target"] > 0)]
 
-        # Розумні викиди: відкидаємо топ-2% найдорожчих товарів ВСЕРЕДИНІ кожної категорії
+        # Розумні викиди
         q98_per_cat = train.groupby("category_id")["_target"].transform(lambda x: x.quantile(0.98))
         train = train[train["_target"] <= q98_per_cat]
 
         y       = np.log1p(train["_target"])
         weights = train["_weight"].values
 
-        # 1. TF-IDF + Ridge (Навчаємо ТІЛЬКИ на тексті)
         self.tfidf = TfidfVectorizer(
             max_features=3000, min_df=5,
             ngram_range=(1, 2), sublinear_tf=True,
@@ -160,18 +197,13 @@ class PriceAnalyzer:
 
         self.ridge = Ridge(alpha=10.0)
         self.ridge.fit(X_tfidf, y, sample_weight=weights)
-
-        # 2. Отримуємо прогнози тексту (Text Predictions)
         text_preds = self.ridge.predict(X_tfidf)
 
-        # 3. Стекінг: Додаємо текстовий прогноз як нову фічу
         X_struct = self._get_struct_matrix(train).copy()
         X_struct["text_pred_log"] = text_preds
 
-        # Вказуємо, що category_id — це категоріальна фіча, а не звичайне число
         cat_idx = [X_struct.columns.get_loc("category_id")]
 
-        # 4. Головна модель HistGradientBoosting
         self.rf = HistGradientBoostingRegressor(
             categorical_features=cat_idx,
             max_iter=200,
@@ -183,7 +215,6 @@ class PriceAnalyzer:
         )
         self.rf.fit(X_struct, y, sample_weight=weights)
 
-        # Метрика
         y_pred_log = self.rf.predict(X_struct)
         y_pred     = np.expm1(y_pred_log)
         y_real     = np.expm1(y)
@@ -254,19 +285,16 @@ class PriceAnalyzer:
             "has_specs": int(bool(re.search(r'\d+\s*(?:gb|гб|%)', text, re.I))),
         }
 
-        # 1. Прогноз по тексту
         X_tfidf = self.tfidf.transform([text])
         text_pred_log = float(self.ridge.predict(X_tfidf)[0])
 
-        # 2. Додаємо текстовий прогноз до структури
         X_struct = pd.DataFrame([row])
         X_struct["text_pred_log"] = text_pred_log
 
-        # 3. Фінальний прогноз
         pred_log = float(self.rf.predict(X_struct)[0])
         pred = float(np.expm1(pred_log))
 
-        if cat_id == 1261:  # Телефони
+        if cat_id == 1261:  # Телефони (Apple)
             pred = pred * 1.55
             min_price = max(3200, cat_med * 0.75)
             pred = max(pred, min_price)
@@ -314,7 +342,7 @@ class PriceAnalyzer:
             "_pct_rank":  round(pct, 2),
         }
 
-    # ── 4. Компаративи ────────────────────────────────────────────────────────
+    # ── 4. Компаративи (ОНОВЛЕНО: FAISS + Fallback) ──────────────────────────
 
     def find_comparables(
         self,
@@ -324,10 +352,39 @@ class PriceAnalyzer:
         source_df: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         df = (source_df if source_df is not None else self.df).copy()
-        if category_id is not None:
-            cat_df = df[df["category_id"] == category_id]
-            df = cat_df if len(cat_df) >= 5 else df
 
+        # Спроба 1: Векторний Semantic Search (FAISS)
+        if getattr(self, "use_vector_search", False):
+            try:
+                import faiss
+                # Кодуємо запит користувача
+                query_emb = self.embedder.encode([query.lower()], convert_to_numpy=True)
+                faiss.normalize_L2(query_emb)
+
+                # Шукаємо з запасом (щоб потім можна було відфільтрувати по source_df/категорії)
+                search_k = min(top_k * 50, len(self.df))
+                distances, indices = self.index.search(query_emb, search_k)
+
+                # Знаходимо глобальні індекси і перетинаємо їх з нашою вузькою вибіркою (напр. тільки fast_sold)
+                global_indices = self.df.iloc[indices[0]].index
+                valid_indices = global_indices.intersection(df.index)
+
+                if category_id is not None:
+                    cat_valid = df.loc[valid_indices]
+                    cat_valid = cat_valid[cat_valid["category_id"] == category_id]
+                    res = cat_valid.head(top_k)
+                else:
+                    res = df.loc[valid_indices].head(top_k)
+
+                if len(res) > 0:
+                    # Перетворюємо 0.854 у 85 (відсоток схожості), щоб agent.py і Gemini розуміли
+                    similarities = distances[0][:len(res)]
+                    res["_sim"] = [int(s * 100) for s in similarities]
+                    return res[["title", "price", "description", "category_id", "_sim"]]
+            except Exception as e:
+                print(f"⚠️ Помилка FAISS під час пошуку: {e}. Використовуємо Fallback...")
+
+        # Спроба 2: Класичний Keyword Overlap (Fallback)
         query_words = set(re.findall(r"[а-яёіїєa-z]{3,}", query.lower()))
         df["_sim"] = df["text"].apply(
             lambda t: len(query_words & set(re.findall(r"[а-яёіїєa-z]{3,}", t)))

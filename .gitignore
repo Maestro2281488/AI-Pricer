@@ -213,5 +213,6 @@ __pycache__/
 .ipynb_checkpoints/
 *.pyc
 /data/
->>>>>>> 791d4b4 (Initial commit)
+
 .idea/
+faiss_index.bin
