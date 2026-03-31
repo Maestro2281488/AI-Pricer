@@ -430,15 +430,22 @@ class PriceAnalyzer:
     # ── 4. Компаративи (ОНОВЛЕНО: FAISS + Fallback) ──────────────────────────
 
     def find_comparables(
-        self,
-        query: str,
-        category_id: Optional[int] = None,
-        top_k: int = 8,
-        source_df: Optional[pd.DataFrame] = None,
+            self,
+            query: str,
+            category_id: Optional[int] = None,
+            top_k: int = 8,
+            source_df: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         df = (source_df if source_df is not None else self.df).copy()
 
-        # Спроба 1: Векторний Semantic Search (FAISS)
+        # 🔥 СТРОГА ФІЛЬТРАЦІЯ: Відрізаємо чужі категорії ДО пошуку!
+        if category_id is not None:
+            df = df[df["category_id"] == category_id]
+            if df.empty:
+                # Якщо проданих товарів у цій категорії 0 — повертаємо порожнечу
+                return pd.DataFrame()
+
+                # Спроба 1: Векторний Semantic Search (FAISS)
         if getattr(self, "use_vector_search", False):
             try:
                 import faiss
@@ -449,14 +456,9 @@ class PriceAnalyzer:
                 distances, indices = self.index.search(query_emb, search_k)
 
                 global_indices = self.df.iloc[indices[0]].index
+                # Перетинаємо глобальні результати з нашою ВЖЕ ВІДФІЛЬТРОВАНОЮ базою
                 valid_indices = global_indices.intersection(df.index)
-
-                if category_id is not None:
-                    cat_valid = df.loc[valid_indices]
-                    cat_valid = cat_valid[cat_valid["category_id"] == category_id]
-                    res = cat_valid.head(top_k)
-                else:
-                    res = df.loc[valid_indices].head(top_k)
+                res = df.loc[valid_indices].head(top_k)
 
                 if len(res) > 0:
                     similarities = distances[0][:len(res)]
@@ -471,9 +473,12 @@ class PriceAnalyzer:
             lambda t: len(query_words & set(re.findall(r"[а-яёіїєa-z]{3,}", t)))
         )
         top = df.nlargest(top_k, "_sim")
-        if top["_sim"].max() > 0:
-            top = top[top["_sim"] > 0]
-        return top[["title", "price", "description", "category_id", "_sim"]].head(top_k)
+
+        # Якщо збігів взагалі немає, не повертаємо випадковий мусор
+        if top["_sim"].max() == 0:
+            return pd.DataFrame()
+
+        return top[top["_sim"] > 0][["title", "price", "description", "category_id", "_sim"]].head(top_k)
 
     def find_fast_sold_comparables(self, query: str, category_id=None, top_k=5):
         if self.fast_sold is None or self.fast_sold.empty:
