@@ -1,6 +1,10 @@
+flask
+flask-cors
 google-generativeai
 pandas
 python-dotenv
 Pillow
 scikit-learn
 numpy
+faiss-cpu
+sentence-transformers

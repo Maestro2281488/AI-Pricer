@@ -313,6 +313,39 @@ class PriceAgent:
         maxp    = strategies_ml.get("MAX_PROFIT", regression_price)
         label   = strategies_ml.get("_label", "medium")
 
+        # 🔥 ДИНАМІЧНІ ВАЖЛИВІ ПРАВИЛА ДЛЯ GEMINI
+        rules = []
+
+        # 1. Правило для Apple (ВИПРАВЛЕНО!)
+        if category_id in (4, 1261):
+            rules.append("Для iPhone (категорія 4) реальна ринкова ціна зазвичай значно вища за середню по категорії. Apple-техніка тримає високу вартість навіть у б/у стані. NeverLock та хороша батарея дають +15-25%.")
+
+        # 2. Правило для Антикваріату / Колекційок
+        is_collectible = bool(re.search(r"рідкісн|колекційн|антиквар|лімітован|ексклюзив|rare|limited|vintage|раритет",
+                                        description.lower()))
+        if is_collectible:
+            rules.append(
+                "КОЛЕКЦІЙНА РІЧ: Це унікальний або рідкісний товар! КАТЕГОРИЧНО ЗАБОРОНЕНО занижувати ціну до медіани звичайних дешевих товарів. Орієнтуйся на преміальний сегмент, кількість одиниць та довіряй високому прогнозу ML.")
+
+        # 3. Правило для Наборів та множення
+        is_set = bool(re.search(r"набір|повна колекція|всі томи|повне зібрання|трилогія|комплект із|повний коробковий",
+                                description.lower()))
+        multiplier_warning = ""
+        if not is_set:
+            multiplier_warning = (
+                "\n⚠️КРИТИЧНО ВАЖЛИВО (МАТЕМАТИКА): Наданий вище ML-прогноз — це ціна ЗА ОДНУ ОДИНИЦЮ товару. "
+                "Якщо в описі або на фотографіях ти бачиш КІЛЬКА штук (наприклад, 4 стільця або 4 диски), "
+                "ТИ ЗОБОВ'ЯЗАНИЙ ПОМНОЖИТИ ML-прогноз (FAST, BALANCED, MAX_PROFIT) на цю кількість!"
+            )
+        else:
+            rules.append(
+                "НАБІР/КОМПЛЕКТ: Це цілий набір (не один предмет). Враховуй сумарну вартість усіх предметів у наборі.")
+
+        rules_text = "\n".join(f"• {r}" for r in rules) if rules else "• Дотримуйся об'єктивної оцінки на основі ринку."
+
+        # Видаляємо зайві пробіли для економії токенів
+        safe_desc = description.replace('\n', ' ')
+
         return f"""
 === ОПИС ТОВАРУ ===
 {safe_desc}
@@ -334,11 +367,10 @@ ID: {category_id or "невідомо"} | Ключові слова: {keywords_t
 
 === ML ПРОГНОЗ ===
 Регресія: {regression_price:.0f} грн | Клас: {label}
-Стратегії ML: FAST={fast} | BALANCED={bal} | MAX_PROFIT={maxp} грн
+Стратегії ML: FAST={fast} | BALANCED={bal} | MAX_PROFIT={maxp} грн{multiplier_warning}
 
-=== ВАЖЛИВЕ ПРАВИЛО ===
-Для iPhone (категорія 4) реальна ринкова ціна зазвичай значно вища за середню по категорії. 
-Apple-техніка тримає високу вартість навіть у б/у стані. NeverLock та хороша батарея дають +15-25%.
+=== ВАЖЛИВІ ПРАВИЛА ===
+{rules_text}
 
 === ЗАВДАННЯ ===
 Визнач реалістичну ціну, поясни коротко (2 речення), дай 3 фактори, пораду (2 речення).
@@ -399,8 +431,8 @@ def _dynamic_advice(description: str, category_id: Optional[int], sold_stats: di
     if m and int(m.group(1)) >= 128:
         parts.append(f"Обсяг {m.group(1)} ГБ — додай це в заголовок оголошення.")
 
-    # NeverLock (тут теж змінив 1261 на 4)
-    if "neverlock" not in text and category_id in (4,):
+    # NeverLock
+    if "neverlock" not in text and category_id in (4, 1261):
         parts.append("Вкажи статус NeverLock — це +5–10% до ціни для телефонів.")
 
     # Загальна порада

@@ -1,25 +1,30 @@
 """
 utils/price_analyzer.py
 
-Покращення ML (v6 - Ultimate: Advanced Features + FAISS Semantic Search + Urgency + KNN Feature):
+Покращення ML (v6.4 - Ultimate: Advanced Features + FAISS Semantic Search + Urgency + KNN Feature + Anti-Crazy Seller + Strict FAISS Category Fix + Smart Brand Normalization + Antique Immunity):
 - Stacking: Ridge (текст) -> HistGradientBoosting (структура).
 - Нові фічі: brand_code, cat_bargain_prob, created_month, created_dow, cat_price_std, is_urgent.
-- Векторний пошук (Semantic Search) на базі FAISS + SentenceTransformers.
-- 🔥 KNN Feature: Використання медіани цін від FAISS як фічі для регресії (без Data Leakage).
+- Векторний пошук (Semantic Search) на базі FAISS + SentenceTransformers (з жорсткою фільтрацією категорій).
+- 🔥 KNN Feature: Використання медіани цін від FAISS як фічі для регресії (БЕЗ змішування категорій).
+- 🔥 Anti-Crazy Seller: Жорстка фільтрація активних оголошень з космічними цінами.
+- 🔥 Collectible/Set Detectors: Детекція наборів та антикваріату.
+- 🔥 Smart Brand Normalization: Розумне розпізнавання "лінивих" брендів (напр. "13 про" -> apple).
+- 🔥 Antique Immunity: Відключення фільтру максимальної ціни для колекційних речей.
 """
 
 import os
 import re
+import warnings
+from collections import Counter
+from typing import Dict, List, Optional
+
 import numpy as np
 import pandas as pd
-from collections import Counter
-from typing import Optional, Dict, List
-
-from sklearn.linear_model import Ridge
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_percentage_error
-import warnings
+
 warnings.filterwarnings("ignore")
 
 
@@ -30,7 +35,8 @@ BRAND_RE = re.compile(
     re.I,
 )
 CONDITION_GOOD_RE = re.compile(
-    r"новий|нова|нове|ідеал|без нюансів|не ношен|запакован|sealed|mint", re.I
+    r"новий|нова|нове|ідеал|без нюансів|не ношен|запакован|sealed|mint",
+    re.I
 )
 CONDITION_BAD_RE = re.compile(
     r"б/у|вживан|подряпин|потертост|пошкодж|зламан|не працює|тріщин|дефект|worn|damaged",
@@ -39,6 +45,17 @@ CONDITION_BAD_RE = re.compile(
 URGENCY_RE = re.compile(
     r"термінов|торг|швидкий продаж|швидко віддам|зв'язку з переїзд|через переїзд|торг доречний",
     re.I,
+)
+
+# 🔥 НОВІ ДЕТЕКТОРИ (Антикваріат розширено!)
+COLLECTIBLE_RE = re.compile(
+    r"рідкісн|колекційн|антиквар|лімітован|ексклюзив|rare|limited|vintage|раритет|"
+    r"xix|xviii|xvii|xvi|хiх|хviii|хvii|хvi|столітт|шкірян|золот.*обріз|першодрук",
+    re.I
+)
+SET_RE = re.compile(
+    r"набір|повна колекція|всі томи|повне зібрання|трилогія|комплект із|повний коробковий",
+    re.I
 )
 
 
@@ -51,10 +68,10 @@ class PriceAnalyzer:
         reserved_df: pd.DataFrame = None,
         deleted_df: pd.DataFrame = None,
     ):
-        self.df          = df.copy()
-        self.fast_sold   = fast_sold
+        self.df = df.copy()
+        self.fast_sold = fast_sold
         self.reserved_df = reserved_df if reserved_df is not None else pd.DataFrame()
-        self.deleted_df  = deleted_df  if deleted_df  is not None else pd.DataFrame()
+        self.deleted_df = deleted_df if deleted_df is not None else pd.DataFrame()
 
         # Зберігаємо мапінги для нових фічей
         self.brand_mapping = {}
@@ -62,7 +79,7 @@ class PriceAnalyzer:
         self.cat_price_std_map = {}
 
         self._build_features()
-        self._init_vector_search() # Спочатку FAISS (він потрібен для регресії)
+        self._init_vector_search()  # Спочатку FAISS (він потрібен для регресії)
         self._train_regression()
 
     # ── Ініціалізація Векторного Пошуку (FAISS) ──────────────────────────────
@@ -84,7 +101,9 @@ class PriceAnalyzer:
                 print("⏳ Створення FAISS індексу (1-2 хв, тільки при першому запуску!)...")
                 texts = self.df["text"].fillna("").tolist()
 
-                embeddings = self.embedder.encode(texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True)
+                embeddings = self.embedder.encode(
+                    texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True
+                )
 
                 faiss.normalize_L2(embeddings)
                 self.index = faiss.IndexFlatIP(embeddings.shape[1])
@@ -98,22 +117,42 @@ class PriceAnalyzer:
             self.use_vector_search = False
             print("⚠️ FAISS або SentenceTransformers не знайдені. Працюємо на класичному Keyword Overlap.")
 
-    def _get_faiss_price_batch(self, texts: List[str], fallbacks: List[float]) -> List[float]:
-        """Отримує медіанну ціну схожих товарів від FAISS, уникаючи Data Leakage."""
+    def _get_faiss_price_batch(
+        self, texts: List[str], fallbacks: List[float], category_ids: List[int] = None
+    ) -> List[float]:
+        """Отримує медіанну ціну схожих товарів від FAISS, з ЖОРСТКИМ збереженням категорій."""
         if not getattr(self, "use_vector_search", False):
             return fallbacks
 
-        emb = self.embedder.encode(texts, batch_size=64, show_progress_bar=False, convert_to_numpy=True)
+        emb = self.embedder.encode(
+            texts, batch_size=64, show_progress_bar=False, convert_to_numpy=True
+        )
         import faiss
         faiss.normalize_L2(emb)
-        distances, indices = self.index.search(emb, 6) # Шукаємо топ-6
+
+        # Якщо передані категорії, беремо більшу вибірку, щоб було з чого відфільтрувати
+        search_k = 50 if category_ids else 6
+        distances, indices = self.index.search(emb, search_k)
 
         faiss_prices = []
         for i in range(len(texts)):
-            # Відкидаємо точні копії (відстань > 0.99), щоб уникнути витоку ціни в тренувальний датасет
+            # Відкидаємо точні копії
             valid_idx = [idx for j, idx in enumerate(indices[i]) if distances[i][j] < 0.99]
+
+            # 🔥 СТРОГА ФІЛЬТРАЦІЯ КАТЕГОРІЇ
+            if category_ids is not None:
+                cat_id = category_ids[i]
+                cat_valid = []
+                for idx in valid_idx:
+                    if idx < len(self.df) and self.df.iloc[idx]["category_id"] == cat_id:
+                        cat_valid.append(idx)
+                    if len(cat_valid) == 5:
+                        break
+                valid_idx = cat_valid
+
             if not valid_idx:
-                valid_idx = indices[i][:5]
+                faiss_prices.append(fallbacks[i])
+                continue
 
             prices = self.df.iloc[valid_idx]["price"].dropna()
             if not prices.empty:
@@ -130,16 +169,23 @@ class PriceAnalyzer:
         if "text" not in d.columns:
             d["text"] = (d["title"].fillna("") + " " + d["description"].fillna("")).str.lower()
 
-        d["desc_len"]   = d["description"].fillna("").str.len()
-        d["title_len"]  = d["title"].fillna("").str.len()
+        d["desc_len"] = d["description"].fillna("").str.len()
+        d["title_len"] = d["title"].fillna("").str.len()
         d["word_count"] = d["description"].fillna("").str.split().str.len()
-        d["has_brand"]  = d["text"].apply(lambda x: int(bool(BRAND_RE.search(x))))
-        d["cond_good"]  = d["text"].apply(lambda x: int(bool(CONDITION_GOOD_RE.search(x))))
-        d["cond_bad"]   = d["text"].apply(lambda x: int(bool(CONDITION_BAD_RE.search(x))))
-        d["is_urgent"]  = d["text"].apply(lambda x: int(bool(URGENCY_RE.search(x))))
+        d["cond_good"] = d["text"].apply(lambda x: int(bool(CONDITION_GOOD_RE.search(x))))
+        d["cond_bad"] = d["text"].apply(lambda x: int(bool(CONDITION_BAD_RE.search(x))))
+        d["is_urgent"] = d["text"].apply(lambda x: int(bool(URGENCY_RE.search(x))))
+
+        # 🔥 НОВІ ФІЧІ: Антикваріат та Набори
+        d["is_collectible"] = d["text"].apply(lambda x: int(bool(COLLECTIBLE_RE.search(x))))
+        d["is_set"] = d["text"].apply(lambda x: int(bool(SET_RE.search(x))))
+
         d["category_id"] = d["category_id"].fillna(0).astype(int)
 
+        # 🔥 Розумна нормалізація брендів
         d["brand_name"] = d["text"].apply(_extract_brand)
+        d["has_brand"] = (d["brand_name"] != "no_brand").astype(int)
+
         self.brand_mapping = {b: i for i, b in enumerate(d["brand_name"].unique())}
         d["brand_code"] = d["brand_name"].map(self.brand_mapping)
 
@@ -150,17 +196,17 @@ class PriceAnalyzer:
 
         if "created_at" in d.columns:
             d["created_month"] = d["created_at"].dt.month.fillna(6).astype(int)
-            d["created_dow"]   = d["created_at"].dt.dayofweek.fillna(3).astype(int)
+            d["created_dow"] = d["created_at"].dt.dayofweek.fillna(3).astype(int)
         else:
             now = pd.Timestamp.now(tz="UTC")
             d["created_month"] = now.month
-            d["created_dow"]   = now.dayofweek
+            d["created_dow"] = now.dayofweek
 
         self.cat_price_std_map = d.groupby("category_id")["price"].std().fillna(0).to_dict()
         d["cat_price_std"] = d["category_id"].map(self.cat_price_std_map).fillna(0.0)
 
         cat_med = d.groupby("category_id")["price"].transform("median")
-        d["cat_median"]     = cat_med.fillna(d["price"].median())
+        d["cat_median"] = cat_med.fillna(d["price"].median())
         d["log_cat_median"] = np.log1p(d["cat_median"])
 
         sold_med = d.groupby("category_id")["sold_price"].transform("median").fillna(
@@ -169,7 +215,7 @@ class PriceAnalyzer:
         d["log_cat_sold_median"] = np.log1p(sold_med)
 
         d["price_pct_rank"] = d.groupby("category_id")["price"].rank(pct=True)
-        d["discount_rate"]  = (
+        d["discount_rate"] = (
             (d["original_price"] - d["sold_price"]) / d["original_price"]
         ).clip(0, 1).fillna(0)
 
@@ -193,8 +239,9 @@ class PriceAnalyzer:
         return [
             "desc_len", "title_len", "has_brand", "brand_code",
             "cond_good", "cond_bad", "word_count", "is_urgent",
+            "is_collectible", "is_set",
             "category_id", "log_cat_median", "log_cat_sold_median", "cat_price_std",
-            "faiss_median_price", # 🔥 Нова супер-фіча!
+            "faiss_median_price",
             "condition_score", "keyword_score", "cat_bargain_prob",
             "created_month", "created_dow",
             "battery_pct", "memory_gb", "has_specs",
@@ -227,20 +274,32 @@ class PriceAnalyzer:
             active_sample = self.df.sample(n=n_sample, random_state=42).copy()
             active_sample["_target"] = active_sample["original_price"]
             active_sample["_weight"] = 1.0
+
+            # 🔥 ІМУНІТЕТ ДЛЯ АНТИКВАРІАТУ: Пропускаємо фільтр, якщо це рідкісна річ
+            active_sample = active_sample[
+                (active_sample["original_price"] <= (active_sample["cat_median"] * 5)) |
+                (active_sample["is_collectible"] == 1) |
+                (active_sample["is_set"] == 1)
+            ]
             frames.append(active_sample)
 
         train = pd.concat(frames, ignore_index=True)
         train = train[train["_target"].notna() & (train["_target"] > 0)]
 
+        # 🔥 Зберігаємо антикваріат навіть якщо він потрапляє у верхні 2% найдорожчих
         q98_per_cat = train.groupby("category_id")["_target"].transform(lambda x: x.quantile(0.98))
-        train = train[train["_target"] <= q98_per_cat]
+        train = train[
+            (train["_target"] <= q98_per_cat) |
+            (train["is_collectible"] == 1) |
+            (train["is_set"] == 1)
+        ]
 
-        # 🔥 Розраховуємо FAISS-ціни для тренувальної вибірки (забере ~3 секунди)
         texts = train["text"].fillna("").tolist()
         fallbacks = train["cat_median"].tolist()
-        train["faiss_median_price"] = self._get_faiss_price_batch(texts, fallbacks)
+        cat_ids = train["category_id"].tolist()
+        train["faiss_median_price"] = self._get_faiss_price_batch(texts, fallbacks, cat_ids)
 
-        y       = np.log1p(train["_target"])
+        y = np.log1p(train["_target"])
         weights = train["_weight"].values
 
         self.tfidf = TfidfVectorizer(
@@ -272,44 +331,49 @@ class PriceAnalyzer:
         self.rf.fit(X_struct, y, sample_weight=weights)
 
         y_pred_log = self.rf.predict(X_struct)
-        y_pred     = np.expm1(y_pred_log)
-        y_real     = np.expm1(y)
+        y_pred = np.expm1(y_pred_log)
+        y_real = np.expm1(y)
         mape = mean_absolute_percentage_error(y_real, y_pred) * 100
-        n    = len(train)
+        n = len(train)
         print(f"✅ ML (Ultimate: Stacking + KNN FAISS) | Train MAPE: {mape:.1f}% | N={n:,}")
 
     def _ensure_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         if "text" not in df.columns:
             df["text"] = (df["title"].fillna("") + " " + df["description"].fillna("")).str.lower()
-        df["desc_len"]   = df["description"].fillna("").str.len()
-        df["title_len"]  = df["title"].fillna("").str.len()
+        df["desc_len"] = df["description"].fillna("").str.len()
+        df["title_len"] = df["title"].fillna("").str.len()
         df["word_count"] = df["description"].fillna("").str.split().str.len()
-        df["has_brand"]  = df["text"].apply(lambda x: int(bool(BRAND_RE.search(x))))
 
-        df["brand_code"] = df["text"].apply(_extract_brand).map(self.brand_mapping).fillna(-1).astype(int)
+        df["cond_good"] = df["text"].apply(lambda x: int(bool(CONDITION_GOOD_RE.search(x))))
+        df["cond_bad"] = df["text"].apply(lambda x: int(bool(CONDITION_BAD_RE.search(x))))
+        df["is_urgent"] = df["text"].apply(lambda x: int(bool(URGENCY_RE.search(x))))
 
-        df["cond_good"]  = df["text"].apply(lambda x: int(bool(CONDITION_GOOD_RE.search(x))))
-        df["cond_bad"]   = df["text"].apply(lambda x: int(bool(CONDITION_BAD_RE.search(x))))
-        df["is_urgent"]  = df["text"].apply(lambda x: int(bool(URGENCY_RE.search(x))))
+        df["is_collectible"] = df["text"].apply(lambda x: int(bool(COLLECTIBLE_RE.search(x))))
+        df["is_set"] = df["text"].apply(lambda x: int(bool(SET_RE.search(x))))
+
+        # 🔥 Розумна нормалізація брендів (Inference)
+        df["brand_name"] = df["text"].apply(_extract_brand)
+        df["has_brand"] = (df["brand_name"] != "no_brand").astype(int)
+        df["brand_code"] = df["brand_name"].map(self.brand_mapping).fillna(-1).astype(int)
 
         if "category_id" not in df.columns:
             df["category_id"] = 0
         df["category_id"] = df["category_id"].fillna(0).astype(int)
 
         df["cat_bargain_prob"] = df["category_id"].map(self.cat_bargain_prob_map).fillna(0.0)
-        df["cat_price_std"]    = df["category_id"].map(self.cat_price_std_map).fillna(0.0)
+        df["cat_price_std"] = df["category_id"].map(self.cat_price_std_map).fillna(0.0)
 
         if "created_at" in df.columns:
             df["created_month"] = df["created_at"].dt.month.fillna(6).astype(int)
-            df["created_dow"]   = df["created_at"].dt.dayofweek.fillna(3).astype(int)
+            df["created_dow"] = df["created_at"].dt.dayofweek.fillna(3).astype(int)
         else:
             now = pd.Timestamp.now(tz="UTC")
             df["created_month"] = now.month
-            df["created_dow"]   = now.dayofweek
+            df["created_dow"] = now.dayofweek
 
         global_med = self.df["price"].median()
-        cat_med    = self.df.groupby("category_id")["price"].median()
+        cat_med = self.df.groupby("category_id")["price"].median()
         df["cat_median"] = df["category_id"].map(cat_med).fillna(global_med)
         df["log_cat_median"] = np.log1p(df["cat_median"])
 
@@ -343,23 +407,24 @@ class PriceAnalyzer:
         now = pd.Timestamp.now(tz="UTC")
         brand_name = _extract_brand(text)
 
-        # 🔥 Розраховуємо FAISS-ціну для запиту користувача
-        faiss_median_price = self._get_faiss_price_batch([text], [cat_med])[0]
+        faiss_median_price = self._get_faiss_price_batch([text], [cat_med], [cat_id])[0]
 
         row = {
             "desc_len": len(description),
             "title_len": len(description.split()[:15]) * 6,
-            "has_brand": int(bool(BRAND_RE.search(text))),
+            "has_brand": 1 if brand_name != "no_brand" else 0,
             "brand_code": int(self.brand_mapping.get(brand_name, -1)),
             "cond_good": int(bool(CONDITION_GOOD_RE.search(text))),
             "cond_bad": int(bool(CONDITION_BAD_RE.search(text))),
             "word_count": len(description.split()),
             "is_urgent": int(bool(URGENCY_RE.search(text))),
+            "is_collectible": int(bool(COLLECTIBLE_RE.search(text))),
+            "is_set": int(bool(SET_RE.search(text))),
             "category_id": int(cat_id),
             "log_cat_median": np.log1p(cat_med),
             "log_cat_sold_median": np.log1p(sold_med),
             "cat_price_std": float(self.cat_price_std_map.get(cat_id, 0.0)),
-            "faiss_median_price": float(faiss_median_price), # 🔥 Додаємо у словник
+            "faiss_median_price": float(faiss_median_price),
             "condition_score": _cond_score(text),
             "keyword_score": 0.5,
             "cat_bargain_prob": float(self.cat_bargain_prob_map.get(cat_id, 0.0)),
@@ -379,7 +444,7 @@ class PriceAnalyzer:
         pred_log = float(self.rf.predict(X_struct)[0])
         pred = float(np.expm1(pred_log))
 
-        if cat_id == 1261:  # Телефони (Apple)
+        if cat_id in (4, 1261):  # Телефони (Apple)
             pred = pred * 1.55
             min_price = max(3200, cat_med * 0.75)
             pred = max(pred, min_price)
@@ -417,35 +482,32 @@ class PriceAnalyzer:
         cat_discount = cat_discount if not np.isnan(cat_discount) else 0.10
 
         fast_discount = max(0.10, cat_discount * 1.5)
-        max_premium   = 0.25 if pct > 0.65 else 0.20
+        max_premium = 0.25 if pct > 0.65 else 0.20
 
         return {
-            "FAST":       max(50, int(round(recommended_price * (1 - fast_discount) / 50) * 50)),
-            "BALANCED":   max(50, int(round(recommended_price / 50) * 50)),
+            "FAST": max(50, int(round(recommended_price * (1 - fast_discount) / 50) * 50)),
+            "BALANCED": max(50, int(round(recommended_price / 50) * 50)),
             "MAX_PROFIT": max(50, int(round(recommended_price * (1 + max_premium) / 50) * 50)),
-            "_label":     "high" if pct > 0.65 else "medium" if pct > 0.35 else "low",
-            "_pct_rank":  round(pct, 2),
+            "_label": "high" if pct > 0.65 else "medium" if pct > 0.35 else "low",
+            "_pct_rank": round(pct, 2),
         }
 
     # ── 4. Компаративи (ОНОВЛЕНО: FAISS + Fallback) ──────────────────────────
 
     def find_comparables(
-            self,
-            query: str,
-            category_id: Optional[int] = None,
-            top_k: int = 8,
-            source_df: Optional[pd.DataFrame] = None,
+        self,
+        query: str,
+        category_id: Optional[int] = None,
+        top_k: int = 8,
+        source_df: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         df = (source_df if source_df is not None else self.df).copy()
 
-        # 🔥 СТРОГА ФІЛЬТРАЦІЯ: Відрізаємо чужі категорії ДО пошуку!
         if category_id is not None:
             df = df[df["category_id"] == category_id]
             if df.empty:
-                # Якщо проданих товарів у цій категорії 0 — повертаємо порожнечу
-                return pd.DataFrame()
+                return pd.DataFrame(columns=["title", "price", "description", "category_id", "_sim"])
 
-                # Спроба 1: Векторний Semantic Search (FAISS)
         if getattr(self, "use_vector_search", False):
             try:
                 import faiss
@@ -456,7 +518,6 @@ class PriceAnalyzer:
                 distances, indices = self.index.search(query_emb, search_k)
 
                 global_indices = self.df.iloc[indices[0]].index
-                # Перетинаємо глобальні результати з нашою ВЖЕ ВІДФІЛЬТРОВАНОЮ базою
                 valid_indices = global_indices.intersection(df.index)
                 res = df.loc[valid_indices].head(top_k)
 
@@ -467,16 +528,14 @@ class PriceAnalyzer:
             except Exception as e:
                 print(f"⚠️ Помилка FAISS під час пошуку: {e}. Використовуємо Fallback...")
 
-        # Спроба 2: Класичний Keyword Overlap (Fallback)
         query_words = set(re.findall(r"[а-яёіїєa-z]{3,}", query.lower()))
         df["_sim"] = df["text"].apply(
             lambda t: len(query_words & set(re.findall(r"[а-яёіїєa-z]{3,}", t)))
         )
         top = df.nlargest(top_k, "_sim")
 
-        # Якщо збігів взагалі немає, не повертаємо випадковий мусор
         if top["_sim"].max() == 0:
-            return pd.DataFrame()
+            return pd.DataFrame(columns=["title", "price", "description", "category_id", "_sim"])
 
         return top[top["_sim"] > 0][["title", "price", "description", "category_id", "_sim"]].head(top_k)
 
@@ -494,21 +553,19 @@ class PriceAnalyzer:
 
     def calculate_price_statistics(self, comparables: pd.DataFrame) -> Dict:
         if comparables.empty or "price" not in comparables.columns:
-            return {"avg_price": 0, "median_price": 0,
-                    "min_price": 0, "max_price": 0, "count": 0}
+            return {"avg_price": 0, "median_price": 0, "min_price": 0, "max_price": 0, "count": 0}
         prices = comparables["price"].dropna()
         if prices.empty:
-            return {"avg_price": 0, "median_price": 0,
-                    "min_price": 0, "max_price": 0, "count": 0}
+            return {"avg_price": 0, "median_price": 0, "min_price": 0, "max_price": 0, "count": 0}
         q25, q75 = prices.quantile([0.25, 0.75])
         return {
-            "avg_price":    round(float(prices.mean()),   0),
+            "avg_price": round(float(prices.mean()), 0),
             "median_price": round(float(prices.median()), 0),
-            "min_price":    round(float(prices.min()),    0),
-            "max_price":    round(float(prices.max()),    0),
-            "q25":          round(float(q25),             0),
-            "q75":          round(float(q75),             0),
-            "count":        int(len(prices)),
+            "min_price": round(float(prices.min()), 0),
+            "max_price": round(float(prices.max()), 0),
+            "q25": round(float(q25), 0),
+            "q75": round(float(q75), 0),
+            "count": int(len(prices)),
         }
 
     def calculate_sold_statistics(self, category_id=None) -> Dict:
@@ -519,9 +576,9 @@ class PriceAnalyzer:
         if sold.empty:
             return {"median_sold": 0, "avg_discount_pct": 0, "avg_days": 0}
         return {
-            "median_sold":      round(float(sold["sold_price"].median()), 0),
+            "median_sold": round(float(sold["sold_price"].median()), 0),
             "avg_discount_pct": round(float(sold["discount_rate"].mean() * 100), 1),
-            "avg_days":         round(float(sold["days_to_sell"].median()), 0),
+            "avg_days": round(float(sold["days_to_sell"].median()), 0),
         }
 
     # ── 6. Нові методи для UI ─────────────────────────────────────────────────
@@ -531,13 +588,11 @@ class PriceAnalyzer:
         cat_df = self.df[self.df["category_id"] == cat_id] if cat_id else self.df
 
         active_count = len(cat_df)
-        avg_days     = float(cat_df["cat_days_median"].median()) if "cat_days_median" in cat_df.columns else 30
+        avg_days = float(cat_df["cat_days_median"].median()) if "cat_days_median" in cat_df.columns else 30
 
         reserved_count = 0
         if not self.reserved_df.empty:
-            reserved_count = len(
-                self.reserved_df[self.reserved_df["category_id"] == cat_id]
-            )
+            reserved_count = len(self.reserved_df[self.reserved_df["category_id"] == cat_id])
 
         if avg_days <= 3:
             speed_label = "🔥 Дуже швидкий"
@@ -550,16 +605,12 @@ class PriceAnalyzer:
 
         return {
             "avg_days_to_sell": round(avg_days, 0),
-            "active_listings":  active_count,
-            "reserved_count":   reserved_count,
-            "speed_label":      speed_label,
+            "active_listings": active_count,
+            "reserved_count": reserved_count,
+            "speed_label": speed_label,
         }
 
-    def price_position(
-        self,
-        price: float,
-        category_id: Optional[int] = None,
-    ) -> Dict:
+    def price_position(self, price: float, category_id: Optional[int] = None) -> Dict:
         cat_id = category_id or 0
         cat_df = self.df[self.df["category_id"] == cat_id] if cat_id else self.df
 
@@ -575,27 +626,27 @@ class PriceAnalyzer:
 
         if pct < 20:
             label = "дуже низька"
-            rec   = "Ціна нижча за 80% ринку. Можна підняти."
+            rec = "Ціна нижча за 80% ринку. Можна підняти."
         elif pct < 40:
             label = "нижче середнього"
-            rec   = "Хороша ціна для швидкого продажу."
+            rec = "Хороша ціна для швидкого продажу."
         elif pct < 60:
             label = "середня ринкова"
-            rec   = "Оптимальна ціна."
+            rec = "Оптимальна ціна."
         elif pct < 80:
             label = "вище середнього"
-            rec   = "Продаж може зайняти більше часу."
+            rec = "Продаж може зайняти більше часу."
         else:
             label = "висока"
-            rec   = "Ціна вища за 80% конкурентів. Рекомендуємо знизити."
+            rec = "Ціна вища за 80% конкурентів. Рекомендуємо знизити."
 
         return {
-            "percentile":     round(pct, 1),
-            "label":          label,
+            "percentile": round(pct, 1),
+            "label": label,
             "recommendation": rec,
-            "market_min":     round(float(all_prices.quantile(0.1)), 0),
-            "market_median":  round(float(all_prices.median()), 0),
-            "market_max":     round(float(all_prices.quantile(0.9)), 0),
+            "market_min": round(float(all_prices.quantile(0.1)), 0),
+            "market_median": round(float(all_prices.median()), 0),
+            "market_max": round(float(all_prices.quantile(0.9)), 0),
         }
 
     def comparables_for_trust(
@@ -604,31 +655,31 @@ class PriceAnalyzer:
         category_id: Optional[int] = None,
         recommended_price: float = 0,
     ) -> Dict:
-        active_comps   = self.find_comparables(query, category_id, top_k=5)
-        sold_comps     = self.find_fast_sold_comparables(query, category_id, top_k=3)
+        active_comps = self.find_comparables(query, category_id, top_k=5)
+        sold_comps = self.find_fast_sold_comparables(query, category_id, top_k=3)
         reserved_comps = self.find_reserved_comparables(query, category_id, top_k=3)
 
-        active_stats   = self.calculate_price_statistics(active_comps)
-        sold_stats     = self.calculate_price_statistics(sold_comps)
+        active_stats = self.calculate_price_statistics(active_comps)
+        sold_stats = self.calculate_price_statistics(sold_comps)
         reserved_stats = self.calculate_price_statistics(reserved_comps)
 
         pos = self.price_position(recommended_price, category_id) if recommended_price else {}
 
         return {
             "active": {
-                "items":  active_comps[["title", "price"]].to_dict("records"),
-                "stats":  active_stats,
-                "label":  "Активні оголошення",
+                "items": active_comps[["title", "price"]].to_dict("records") if not active_comps.empty else [],
+                "stats": active_stats,
+                "label": "Активні оголошення",
             },
             "sold": {
-                "items":  sold_comps[["title", "price"]].to_dict("records") if not sold_comps.empty else [],
-                "stats":  sold_stats,
-                "label":  "Реально продані (< 3 дні)",
+                "items": sold_comps[["title", "price"]].to_dict("records") if not sold_comps.empty else [],
+                "stats": sold_stats,
+                "label": "Реально продані (< 3 дні)",
             },
             "reserved": {
-                "items":  reserved_comps[["title", "price"]].to_dict("records") if not reserved_comps.empty else [],
-                "stats":  reserved_stats,
-                "label":  "Зарезервовані (ціна спрацювала)",
+                "items": reserved_comps[["title", "price"]].to_dict("records") if not reserved_comps.empty else [],
+                "stats": reserved_stats,
+                "label": "Зарезервовані (ціна спрацювала)",
             },
             "price_position": pos,
         }
@@ -647,13 +698,22 @@ class PriceAnalyzer:
 
 def _extract_brand(text: str) -> str:
     """Витягує назву бренду з тексту."""
+    if re.search(r'iphone|apple|ipad|macbook|airpods|1[1-6]\s*pro|1[1-6]\s*про|pro\s*max|про\s*макс|1[1-6]\s*mini|1[1-6]\s*плюс', text, re.I):
+        return 'apple'
+
+    if re.search(r'samsung|galaxy|s2[0-4]|a5[0-4]|z\s*fold|z\s*flip', text, re.I):
+        return 'samsung'
+
+    if re.search(r'xiaomi|redmi|poco|mi\s*1[0-4]', text, re.I):
+        return 'xiaomi'
+
     m = BRAND_RE.search(text)
     return m.group(0).lower() if m else "no_brand"
 
 
 def _cond_score(text: str) -> float:
     good = len(CONDITION_GOOD_RE.findall(text))
-    bad  = len(CONDITION_BAD_RE.findall(text))
+    bad = len(CONDITION_BAD_RE.findall(text))
     if good == 0 and bad == 0:
         return 0.5
     return round(good / (good + bad + 1e-9), 3)
