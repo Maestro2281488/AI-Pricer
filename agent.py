@@ -432,7 +432,7 @@ def _dynamic_advice(description: str, category_id: Optional[int], sold_stats: di
         parts.append(f"Обсяг {m.group(1)} ГБ — додай це в заголовок оголошення.")
 
     # NeverLock
-    if "neverlock" not in text and category_id in (4, 1261):
+    if "neverlock" not in text and category_id in (4,):
         parts.append("Вкажи статус NeverLock — це +5–10% до ціни для телефонів.")
 
     # Загальна порада

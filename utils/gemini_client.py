@@ -18,7 +18,7 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 _MODEL_NAME  = "gemini-2.5-flash-lite"
 _MAX_RETRIES = 2
-_TIMEOUT_SEC = 12.0
+_TIMEOUT_SEC = 6
 
 def _build_model():
     # Визначаємо жорстку схему JSON (Structured Outputs)
